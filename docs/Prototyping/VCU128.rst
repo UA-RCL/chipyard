@@ -1,0 +1,94 @@
+Running a Design on VCU128
+==========================
+
+Basic VCU128 Design
+-------------------
+
+The default Xilinx VCU128 harness is setup to have two UARTs, DDR backing memory, and JTAG over the on-board USB-JTAG cable.
+Since the VCU128 does not have an SDCard slot, the harness uses a TSI-over-UART adapter to load programs into the DDR backing memory.
+Both UARTs are connected to the on-board FTDI USB-UART/JTAG bridge: UART0 is used as the terminal of the DUT and UART1 carries TSI to the host machine (the machine connected to the VCU128).
+To extend this design, you can create your own Chipyard configuration and add the ``WithVCU128Tweaks`` located in `fpga/src/main/scala/vcu128/Configs.scala <https://ucb.bar/chipyard/fpga/src/main/scala/vcu128/Configs.scala>`__.
+Adding this config fragment will enable and connect the UARTs, TSI-over-UART, JTAG, and DDR backing memory to your Chipyard design/config.
+
+.. literalinclude:: ../../fpga/src/main/scala/vcu128/Configs.scala
+    :language: scala
+    :start-after: DOC include start: WithVCU128Tweaks and Rocket
+    :end-before: DOC include end: WithVCU128Tweaks and Rocket
+
+To build the design (Vivado should be added to the ``PATH``), run:
+
+.. code-block:: shell
+
+    cd fpga/
+    make SUB_PROJECT=vcu128 bitstream
+
+Brief Implementation Description
+--------------------------------
+
+The VCU128 design follows the same structure as the VCU118 design (see :ref:`Prototyping/VCU118:Brief Implementation Description + More Complicated Designs`).
+The ``VCU128FPGATestHarness`` (located in `fpga/src/main/scala/vcu128/TestHarness.scala <https://ucb.bar/chipyard/fpga/src/main/scala/vcu128/TestHarness.scala>`__) uses ``Overlays`` from the ``VCU128ShellBasicOverlays`` in fpga-shells to connect to the VCU128 external IOs.
+For example, the following shows both UART ``Overlays`` being "placed" into the design, the 1st with the UART of the ``ChipTop`` and the 2nd with the TSI-over-UART port of the ``ChipTop``.
+
+.. literalinclude:: ../../fpga/src/main/scala/vcu128/TestHarness.scala
+    :language: scala
+    :start-after: DOC include start: UartOverlay
+    :end-before: DOC include end: UartOverlay
+
+The DDR ``Overlay`` uses the VCU128 DDR4 component memory (4GB with ECC).
+
+.. Note:: Remember that since whenever a new test harness is created (or the config changes, or the config packages changes, or...), you need to modify the make invocation.
+    For example, ``make SUB_PROJECT=vcu128 CONFIG=MyNewVCU128Config CONFIG_PACKAGE=this.is.my.scala.package bitstream``.
+    See :ref:`Prototyping/General:Generating a Bitstream` for information on the various make variables.
+
+Running Linux on VCU128 Designs
+-------------------------------
+
+As mentioned above, the default VCU128 harness is setup with two UARTs.
+These are utilized to both interact with the DUT (with UART0) and load in Linux (with TSI over UART1).
+The following steps describe how to build and run buildroot Linux on the prototype platform.
+
+Building Linux with FireMarshal
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Since the prototype currently does not have a block device setup for it, we build Linux with the rootfs built into the binary (otherwise known as "initramfs" or "nodisk" version of Linux).
+To make building this type of Linux binary easy, we will use the FireMarshal platform (see :ref:`fire-marshal` for more information).
+
+1. Setup FireMarshal (see :ref:`fire-marshal` on the initial setup).
+2. By default, FireMarshal is setup to work with FireSim.
+   Instead, we want to target the prototype platform.
+   This is done by switching the FireMarshal "board" from "firechip" to "prototype" using ``marshal-config.yaml``:
+
+.. code-block:: shell
+
+    # this assumes you do not have a `marshal-config.yaml` file already setup
+    echo "board-dir : 'boards/prototype'" > $PATH_TO_FIREMARSHAL/marshal-config.yaml
+
+.. Note:: Refer to the FireMarshal docs on more ways to set the board differently through environment variables and more.
+
+3. Next, build the workload (a.k.a buildroot Linux) in FireMarshal with the ``nodisk`` option flag.
+   For the rest of these steps, we will assume you are using the base ``br-base.json`` workload.
+
+.. code-block:: shell
+
+    ./marshal -v -d build br-base.json # here the -d indicates --nodisk or initramfs
+
+Unlike the VCU118, the Linux binary does not need to be flattened, since ``uart_tsi`` loads the ELF binary (``br-base-bin-nodisk``) directly into memory.
+
+Transfer and Run Linux over UART
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After programming the FPGA, connect to the UART0 serial port to interact with Linux via the UART console (in this case called ``ttyUSB1``) using something like ``screen``:
+
+.. code-block:: shell
+
+   screen -S FPGA_UART_CONSOLE /dev/ttyUSB1 115200
+
+Then, in a separate terminal, load and run the Linux binary over UART1 (in this case called ``ttyUSB2``) with ``uart_tsi``:
+
+.. code-block:: shell
+
+    ./uart_tsi +tty=/dev/ttyUSB2 +baudrate=921600 $PATH_TO_FIREMARSHAL/images/prototype/br-base/br-base-bin-nodisk
+
+.. Note:: Loading the Linux binary over UART takes several minutes. Using a smaller workload reduces the loading time.
+
+Once loaded, you should see Linux output on the UART console (in some cases you might need to reset the DUT). Sign in as 'root' with password 'fpga'.
