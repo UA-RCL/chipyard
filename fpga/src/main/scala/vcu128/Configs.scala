@@ -41,3 +41,20 @@ class RocketVCU128Config extends Config(
   new chipyard.RocketConfig
 )
 // DOC include end: WithVCU128Tweaks and Rocket
+
+// Chip-side ports for the (upcoming) Ethernet subsystem, no Ethernet yet:
+//   - AXI4 MMIO port at 0x6000_0000 (Ethernet and DMA registers), backed by a 4 KiB test RAM for now
+//   - AXI4 front-bus slave port (Ethernet DMA into DDR), tied off for now
+//   - 3 external interrupts (DMA TX, DMA RX, Ethernet core), tied off for now
+class WithVCU128EthernetPorts extends Config(
+  new WithMMIOTestRAM ++
+  new freechips.rocketchip.subsystem.WithDefaultMMIOPort ++
+  new freechips.rocketchip.subsystem.WithDefaultSlavePort ++
+  new freechips.rocketchip.subsystem.WithNExtTopInterrupts(3)
+)
+
+class RocketVCU128EthernetConfig extends Config(
+  new WithVCU128EthernetPorts ++
+  new WithVCU128Tweaks ++
+  new chipyard.RocketConfig
+)
