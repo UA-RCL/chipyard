@@ -54,6 +54,7 @@ class WithVCU128EthernetPorts extends Config(
 )
 
 class RocketVCU128EthernetConfig extends Config(
+  new WithVCU128Ethernet ++
   new WithVCU128EthernetPorts ++
   new WithVCU128Tweaks ++
   new chipyard.RocketConfig
