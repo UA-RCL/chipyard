@@ -5,24 +5,36 @@ import chisel3.experimental.{Analog, attach}
 
 import scala.collection.immutable.SeqMap
 
-import org.chipsalliance.cde.config.{Config, Field}
+import org.chipsalliance.cde.config.{Config, Field, Parameters}
+import org.chipsalliance.diplomacy.lazymodule.{InModuleBody, LazyModule, LazyModuleImp}
+import org.chipsalliance.diplomacy.nodes.{MonitorsEnabled}
+import freechips.rocketchip.amba.axi4._
+import freechips.rocketchip.devices.tilelink.{DevNullParams, TLError}
+import freechips.rocketchip.diplomacy.{AddressSet, TransferSizes}
+import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.{ElaborationArtefacts}
 
 import sifive.fpgashells.ip.xilinx.{IOBUF}
 import sifive.fpgashells.shell._
 
+import chipyard.harness._
+import chipyard.iobinders._
+
 // 1G Ethernet on the VCU128: AXI 1G Ethernet (tri-mode MAC + 1G PCS/PMA, SGMII over LVDS) to the on-board TI DP83867
 // PHY. IP settings and pins reproduce the working MicroBlaze example (example_ethernet), which used the VCU128 board
 // flow; the Chipyard flow has no board part, so they are written out explicitly here.
 //
-// Step 4 of the bring-up: the core is instantiated with its pins and placement constraints only. Its register
-// interface and streams are tied off (registers come in step 5, DMA and interrupts in step 6).
+// Bring-up state (step 5): pins and placement as in the example; the register interface is on the chip's AXI4 MMIO
+// port at its base (0x6000_0000). The streams are still tied off (DMA and interrupts come in step 6).
 
 case object VCU128EthernetKey extends Field[Boolean](false)
 
-class WithVCU128Ethernet extends Config((site, here, up) => {
-  case VCU128EthernetKey => true
-})
+class WithVCU128Ethernet extends Config(
+  new WithVCU128EthernetMMIO ++
+  new Config((site, here, up) => {
+    case VCU128EthernetKey => true
+  })
+)
 
 // Ports of the vcu128_eth IP (from its instantiation template, vcu128_eth.veo).
 // The chipyard_fpga sbt project is built without the Chisel compiler plugin, which every Bundle needs, so this is a
@@ -83,9 +95,85 @@ class VCU128EthernetBlackBox extends BlackBox {
   override def desiredName = "vcu128_eth"
   // Named explicitly: without the compiler plugin (see VCU128EthernetIO) nothing else names it "io"
   val io = IO(new VCU128EthernetIO).suggestName("io")
+
+  def bool(name: String) = io(name).asInstanceOf[Bool]
+  def uint(name: String) = io(name).asInstanceOf[UInt]
 }
 
+// Bridge from the chip's AXI4 MMIO port (64-bit, bursts, 4 ID bits) to the core's 32-bit AXI4-Lite register
+// interface, built from rocket-chip adapters: AXI4 -> TileLink (as rocket-chip's AXI4 slave port does), a TileLink
+// crossbar, and TileLink -> single-beat 32-bit AXI4 with no ID bits (as rocket-chip's AXI4-Lite tests do), which is
+// AXI4-Lite. Addresses in the MMIO window outside the register block get an error response from a TLError device.
+class VCU128EthernetMMIO(edge: AXI4EdgeParameters, base: BigInt, size: BigInt)(implicit p: Parameters)
+    extends LazyModule {
+  val master = AXI4MasterNode(Seq(edge.master))
+  val regs = AXI4SlaveNode(Seq(AXI4SlavePortParameters(
+    slaves = Seq(AXI4SlaveParameters(
+      address       = Seq(AddressSet(base + VCU128Ethernet.regsOffset, VCU128Ethernet.regsSize - 1)),
+      supportsRead  = TransferSizes(1, 4),
+      supportsWrite = TransferSizes(1, 4),
+      interleavedId = Some(0))),
+    beatBytes = 4)))
+  val error = LazyModule(new TLError(
+    DevNullParams(Seq(AddressSet(base + size - 0x1000, 0xfff)), maxAtomic = 4, maxTransfer = edge.slave.maxTransfer),
+    beatBytes = edge.slave.beatBytes))
+  val xbar = TLXbar()
+
+  // wcorrupt = false: the chip's MMIO port has no write-corrupt bit
+  xbar := TLFIFOFixer(TLFIFOFixer.all) := AXI4ToTL(wcorrupt = false) := AXI4UserYanker(Some(4)) := AXI4Fragmenter() := master
+  regs := AXI4UserYanker() := AXI4IdIndexer(0) := TLToAXI4() :=
+    TLFragmenter(4, edge.slave.maxTransfer, holdFirstDeny = true) := TLWidthWidget(edge.slave.beatBytes) := xbar
+  error.node := xbar
+
+  val io_axi4 = InModuleBody { master.makeIOs() }
+  val io_regs = InModuleBody { regs.makeIOs() }
+
+  lazy val module = new LazyModuleImp(this)
+}
+
+// Binds the chip's AXI4 MMIO port to the Ethernet core's register interface
+class WithVCU128EthernetMMIO extends HarnessBinder({
+  case (th: VCU128FPGATestHarnessImp, port: AXI4MMIOPort, chipId: Int) => {
+    val eth = th.ethernet.getOrElse(throw new Exception("WithVCU128EthernetMMIO needs WithVCU128Ethernet"))
+    val mmio = LazyModule(new VCU128EthernetMMIO(port.edge, port.params.base, port.params.size)(
+      Parameters.empty.alterPartial { case MonitorsEnabled => false }))
+    withClockAndReset(port.io.clock, th.referenceReset) { Module(mmio.module).suggestName("eth_mmio") }
+    mmio.io_axi4.head <> port.io.bits
+
+    // AXI4-Lite: every transfer is a single beat of at most 4 bytes, and there are no ID bits
+    val regs = mmio.io_regs.head
+    eth.io("s_axi_lite_clk") := port.io.clock
+    eth.uint("s_axi_awaddr")  := regs.aw.bits.addr(VCU128Ethernet.regsAddrBits - 1, 0)
+    eth.bool("s_axi_awvalid") := regs.aw.valid
+    regs.aw.ready             := eth.bool("s_axi_awready")
+    eth.uint("s_axi_wdata")   := regs.w.bits.data
+    eth.uint("s_axi_wstrb")   := regs.w.bits.strb
+    eth.bool("s_axi_wvalid")  := regs.w.valid
+    regs.w.ready              := eth.bool("s_axi_wready")
+    regs.b.bits               := DontCare
+    regs.b.bits.id            := 0.U
+    regs.b.bits.resp          := eth.uint("s_axi_bresp")
+    regs.b.valid              := eth.bool("s_axi_bvalid")
+    eth.bool("s_axi_bready")  := regs.b.ready
+    eth.uint("s_axi_araddr")  := regs.ar.bits.addr(VCU128Ethernet.regsAddrBits - 1, 0)
+    eth.bool("s_axi_arvalid") := regs.ar.valid
+    regs.ar.ready             := eth.bool("s_axi_arready")
+    regs.r.bits               := DontCare
+    regs.r.bits.id            := 0.U
+    regs.r.bits.data          := eth.uint("s_axi_rdata")
+    regs.r.bits.resp          := eth.uint("s_axi_rresp")
+    regs.r.bits.last          := true.B
+    regs.r.valid              := eth.bool("s_axi_rvalid")
+    eth.bool("s_axi_rready")  := regs.r.ready
+  }
+})
+
 object VCU128Ethernet {
+  // Register block of the core in the chip's MMIO window: 256 KiB (18 address bits) at the window's base
+  val regsOffset   = BigInt(0)
+  val regsAddrBits = 18
+  val regsSize     = BigInt(1) << regsAddrBits
+
   // Pins (bank 67) and I/O standards, as in the example's routed design
   val pins = Seq(
     ("eth_sgmii_rxp",  "BJ22", "DIFF_HSTL_I_18"),
@@ -143,7 +231,9 @@ object VCU128Ethernet {
        |}
        |""".stripMargin
 
-  def apply(th: VCU128FPGATestHarnessImp): Unit = {
+  // Creates the core, its pins and tie-offs. The register interface (and its clock) is connected by
+  // WithVCU128EthernetMMIO.
+  def apply(th: VCU128FPGATestHarnessImp): VCU128EthernetBlackBox = {
     ElaborationArtefacts.add("vcu128_eth.vivado.tcl", ipTcl(th.referenceClockFreqMHz.toDouble))
 
     val sgmii_rxp = IO(Input(Bool())).suggestName("eth_sgmii_rxp")
@@ -166,12 +256,11 @@ object VCU128Ethernet {
     }
 
     val eth = Module(new VCU128EthernetBlackBox).suggestName("eth")
-    def b(n: String) = eth.io(n).asInstanceOf[Bool]
-    def u(n: String) = eth.io(n).asInstanceOf[UInt]
+    def b(n: String) = eth.bool(n)
+    def u(n: String) = eth.uint(n)
 
     // Register interface and streams run on the chip's bus clock
     val resetn = !th.referenceReset.asBool
-    eth.io("s_axi_lite_clk") := th.referenceClock
     eth.io("axis_clk")       := th.referenceClock
     Seq("s_axi_lite_resetn", "axi_txd_arstn", "axi_txc_arstn", "axi_rxd_arstn", "axi_rxs_arstn").foreach(b(_) := resetn)
 
@@ -200,11 +289,11 @@ object VCU128Ethernet {
       Seq("tx_dly_rdy", "rx_dly_rdy", "tx_vtc_rdy", "rx_vtc_rdy").foreach(n => b(s"${n}_$i") := true.B)
     }
 
-    // Step 4: register interface and streams tied off
-    Seq("s_axi_araddr", "s_axi_awaddr", "s_axi_wdata", "s_axi_wstrb",
-        "s_axis_txd_tdata", "s_axis_txd_tkeep", "s_axis_txc_tdata", "s_axis_txc_tkeep").foreach(u(_) := 0.U)
-    Seq("s_axi_arvalid", "s_axi_awvalid", "s_axi_wvalid",
-        "s_axis_txd_tlast", "s_axis_txd_tvalid", "s_axis_txc_tlast", "s_axis_txc_tvalid").foreach(b(_) := false.B)
-    Seq("s_axi_bready", "s_axi_rready", "m_axis_rxd_tready", "m_axis_rxs_tready").foreach(b(_) := true.B)
+    // Streams tied off until the DMA is added (step 6)
+    Seq("s_axis_txd_tdata", "s_axis_txd_tkeep", "s_axis_txc_tdata", "s_axis_txc_tkeep").foreach(u(_) := 0.U)
+    Seq("s_axis_txd_tlast", "s_axis_txd_tvalid", "s_axis_txc_tlast", "s_axis_txc_tvalid").foreach(b(_) := false.B)
+    Seq("m_axis_rxd_tready", "m_axis_rxs_tready").foreach(b(_) := true.B)
+
+    eth
   }
 }

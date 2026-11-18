@@ -110,7 +110,7 @@ class VCU128FPGATestHarnessImp(_outer: VCU128FPGATestHarness) extends LazyRawMod
   childClock := referenceClock
   childReset := referenceReset
 
-  if (p(VCU128EthernetKey)) VCU128Ethernet(this)
+  val ethernet: Option[VCU128EthernetBlackBox] = if (p(VCU128EthernetKey)) Some(VCU128Ethernet(this)) else None
 
   instantiateChipTops()
 }
