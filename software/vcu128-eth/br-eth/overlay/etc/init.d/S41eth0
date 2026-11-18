@@ -1,0 +1,27 @@
+#!/bin/sh
+# Brings up eth0 (VCU128 AXI 1G Ethernet) at boot and gets an address over DHCP. udhcpc -b keeps retrying in the
+# background, because the link and the switch port can take several seconds to come up after boot (as in the
+# VCU128 PetaLinux example). The MAC address comes from the device tree (software/vcu128-eth/br-eth/mac-address).
+
+PIDFILE=/var/run/udhcpc.eth0.pid
+
+case "$1" in
+  start)
+    printf "Starting eth0 (DHCP): "
+    ip link set eth0 up && udhcpc -b -p "$PIDFILE" -i eth0 >/dev/null 2>&1
+    [ $? -eq 0 ] && echo "OK" || echo "FAIL"
+    ;;
+  stop)
+    printf "Stopping eth0: "
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+    ip link set eth0 down
+    echo "OK"
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac

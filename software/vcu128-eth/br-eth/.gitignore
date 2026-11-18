@@ -1,0 +1,5 @@
+# The board's MAC address (local only, not committed)
+mac-address
+# Built by host-init.sh
+local-mac.dtsi
+vcu128-eth.dtb

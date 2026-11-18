@@ -1,0 +1,19 @@
+{
+  "name" : "br-eth",
+  "base" : "br-base.json",
+  "distro" : {
+      "name" : "br",
+      "opts" : {
+          "configs" : ["buildroot-config"]
+      }
+  },
+  "host-init" : "host-init.sh",
+  "overlay" : "overlay",
+  "linux" : {
+      "config" : "linux-config",
+      "modules" : {}
+  },
+  "firmware" : {
+      "opensbi-build-args" : "FW_FDT_PATH=../../../../../vcu128-eth/br-eth/vcu128-eth.dtb"
+  }
+}

@@ -1,0 +1,40 @@
+#!/bin/sh
+# Generates the dropbear SSH host keys in the background at boot, as the PetaLinux image does, so the first ssh
+# connection does not have to wait for them. Without this, dropbear (-R, started by S50dropbear) generates a key on
+# the first connection, which takes minutes for RSA on the 50 MHz core. Ed25519, the type ssh normally picks, is
+# generated first and takes about a second. The root filesystem is in RAM, so the keys are new on every boot.
+
+KEYDIR=/etc/dropbear
+
+case "$1" in
+  start)
+    # Buildroot ships /etc/dropbear as a symlink to /var/run/dropbear; replace it with a directory, as S50dropbear
+    # would (or create the symlink's target if the root filesystem is read-only)
+    if [ -L "$KEYDIR" ]; then
+      if rm -f "$KEYDIR" 2>/dev/null; then
+        mkdir -p "$KEYDIR"
+      else
+        mkdir -p "$(readlink "$KEYDIR")"
+      fi
+    fi
+    echo "Generating dropbear SSH host keys in the background"
+    (
+      umask 077
+      for t in ed25519 ecdsa rsa; do
+        f="$KEYDIR/dropbear_${t}_host_key"
+        [ -f "$f" ] && continue
+        # Written to a temporary file first so dropbear never reads a partial key. If dropbear generated this type
+        # itself in the meantime (a connection arrived first), keep its key.
+        if dropbearkey -t "$t" -f "$f.tmp" >/dev/null 2>&1 && [ ! -f "$f" ]; then
+          mv "$f.tmp" "$f"
+        fi
+        rm -f "$f.tmp"
+      done
+    ) &
+    ;;
+  stop|restart|reload)
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+esac
